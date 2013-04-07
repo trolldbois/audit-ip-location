@@ -13,14 +13,30 @@ import time
 
 import bsddb
 
+import geopy
+import geopy.distance
+import pygeoip
+import IPy
+from cymru.ip2asn.dns import DNSClient as ip2asn
 
+from utils import Memoized
 
 log=logging.getLogger('audit')
+
+DATADB='data/alllogins.db'
 
 GEOIP_CITIES='geoip/berkelydb/hip_ip4_city_lat_lng.db'
 GEOIP_COUNTRIES='geoip/berkelydb/hip_ip4_country.db'
 
+MAXMIND_CITIES='geoip/maxmind/GeoLiteCity.dat'
+MAXMIND_COUNTRIES='geoip/maxmind/GeoIP.dat'
+MAXMIND_ASN='geoip/maxmind/GeoIPASNum.dat'
+
 from conf import GW
+
+import codecs
+import locale
+sys.stdout = codecs.getwriter(locale.getpreferredencoding())(sys.stdout);
 
 # Used to find PRIVATE ip range
 def bin2int(s):
@@ -150,7 +166,7 @@ class DB:
         if self._conn is not None:
             self._conn.close()
             self._conn=None
-        _conn = sqlite3.connect('alllogins.db')
+        _conn = sqlite3.connect(DATA_DB)
         for t in ['ip2asn','user2asn']:
             try:
                 _conn.cursor().execute('DROP TABLE %s'%(t))
@@ -161,7 +177,7 @@ class DB:
     @property
     def conn(self):
         if self._conn is None:
-            self._conn = sqlite3.connect('alllogins.db')
+            self._conn = sqlite3.connect(DATADB)
         try:
             if self.cursor.execute('SELECT COUNT(date) FROM logins'):
                 pass
@@ -406,14 +422,20 @@ class FixWorker(Worker):
         self.session.commit()
         log.info('[+] IP2ASN geoip location FIXED:%d MISSES:%d'%(fixes,misses))
 
+
+
 ''' Analysis and controllers'''
 class AnalysisWorker(Worker):
     checks=None
     cache=None
     ip2city=None
+    geoip = pygeoip.GeoIP(MAXMIND_CITIES, pygeoip.MEMORY_CACHE)
+    free_ip2city = bsddb.btopen(GEOIP_CITIES)
+    free_allips=[int(x) for x in free_ip2city.keys()]
+    free_allips.sort()
+
 
     def cacheIPstoASN(self):
-        import IPy
         from cymru.ip2asn.dns import DNSClient as ip2asn
         self.ip2city=bsddb.btopen(GEOIP_CITIES)
         cymru_client = ip2asn()
@@ -525,7 +547,104 @@ class AnalysisWorker(Worker):
         self.commit()
         print '[+] user2ASN commited new:%d total:%d'%(ret,len(user2ASN))
     
+    def free_record_by_addr(self, ip):
+        cymru_client = ip2asn()
+        #
+        asn = cymru_client.lookup(ip)
+        ipObj = IPy.IP(ip)
+        # get all known geoip sorted
+        # go through all geoip, to find closest geoip from ipObj
+        try:
+            ind_geoip=0
+            prefix=IPy.IP(asn.prefix)
+            try:
+                location = self.free_ip2city[str(prefix.int())]
+                city,lat,lon = location.split(' ')
+                return (city,lat,lon)
+            except KeyError,e:
+                pass # not so easy
+            # find closest head
+            while ind_geoip < len(self.free_allips) and (self.free_allips[ind_geoip]<=ipObj.int()):
+                ind_geoip+=1
+            # ignore IndexError
+            prefix_geoip=IPy.IP(self.free_allips[ind_geoip-1])
+            if prefix_geoip not in prefix:
+                log.debug(' %s cymru_prefix %s !contains geoip %s %s'%
+                          (ipObj.ip,prefix,prefix_geoip, IPy.IP(self.free_allips[ind_geoip])))
+                
+                location = self.free_ip2city[str(prefix_geoip.int())]
+                city,lat,lon = location.split(' ')
+                return (city,lat,lon)
+            # fix the ip2asn entry
+        except StopIteration,e:
+            pass
+        return None
+
+    @Memoized
+    def getLocation(self,ip):
+        ipObj = IPy.IP(ip)
+        if ipObj.iptype() == 'PRIVATE':
+            return None
+        location = self.geoip.record_by_addr(ip)
+        if location is None or location['city'] == '': #is None:
+            # try free geoip
+            res = self.free_record_by_addr(ip)
+            if res is None:
+                #print location
+                log.info('Unknown IP location : %s - %s'%(ip, location['country_name']))
+                return None
+            c,lat,lon = res
+            location = dict()
+            location['city'] = '%s (Approx)'%c
+            location['latitude'] = lat
+            location['longitude'] = lon
+        return location
+
     def distanceRisk(self):
+        #Logins: id, date, time, user, src, server, ts,
+        # get all users        
+        for user, in self.session.query(Logins.user).distinct():
+            logins = [l for l in self.session.query(Logins).filter(Logins.user 
+                            == user).order_by(Logins.ts)]
+            if len(logins)<2:
+                print '%s skip'%(user)
+                continue
+            # get first location
+            prev_location = None
+            try:
+                while prev_location is None:
+                    prev_login = logins.pop(0)
+                    prev_location = self.getLocation(prev_login.src)
+            except IndexError,e:
+                continue
+            prev_pos = geopy.Point(prev_location['latitude'], prev_location['longitude'])
+
+            totalkm=0
+            print '-'*20,user
+            for login in logins:
+                # get next location
+                location = self.getLocation(login.src)
+                if location is None:
+                    continue
+                pos = geopy.Point(location['latitude'], location['longitude'])
+                if (pos != prev_pos):
+                    dist = geopy.distance.distance(prev_pos, pos).km
+                    totalkm += dist
+                    duration = (login.ts-prev_login.ts).total_seconds()/3600
+                    speed = dist/duration
+                    log.debug('%4.2f km/h (%2.2f/%4.2f)'%(speed,dist,(login.ts-prev_login.ts).total_seconds()))
+                    if (speed > 300) and (dist > 400): # > 100km/h # FIXME, 400 km for bad geoip
+                        print ("A: %s|%4.0f km/h '%s'->'%s'\t(%4.0f km|%2.2f h)"%(
+                                user, speed, prev_location['city'], location['city'], dist, duration))#.encode('utf-8', 'ignore')
+                        print "\ta-",prev_login.ts, prev_location['city'], prev_pos, prev_login.src
+                        print "\tb-",login.ts, location['city'], pos, login.src
+                # else continue and switch
+                prev_pos=pos
+                prev_location=location
+                prev_login=login
+            print '%s done - %4.0f km'%(user,totalkm)
+
+    def distanceRiskOld(self):
         import geopy
         import geopy.distance
         # get all users        
@@ -578,12 +697,13 @@ class AnalysisWorker(Worker):
         print '[+] src ASN: %d'%(nb_asn)
         # show distance-based risks
         self.distanceRisk()
+        return
         # show countries
         countries=dict()
         users_cc=dict()
         users_asn=dict()
-        asn_country_cache=dict([(asn,cc) 
-                for asn,prefix,cc in self.getASNCache()])
+        #asn_country_cache=dict([(asn,cc) 
+        #        for asn,prefix,cc in self.getASNCache()])
         try:
             for date,time,user,src,asn,cc in self.getFullLogin():
                 if cc not in countries:
@@ -683,7 +803,7 @@ def main():
     rootparser = argparse.ArgumentParser(description='Read checkpoint PVN logs')
     rootparser.add_argument('--debug', action='store_true', help='Debug mode on.')
     rootparser.add_argument('--dbname', type=str, action='store', 
-                            default='alllogins.db', help='Debug mode on.')
+                            default=DATADB, help='Debug mode on.')
     subparsers = rootparser.add_subparsers(help='sub-command help')
     consume_p = subparsers.add_parser('consume', 
         help='Consume log file and inserts in DB.')
@@ -745,6 +865,8 @@ def fix(args):
     w.fixLoginsTS()
     w.fixIP2ASN()
      
+
+
 
 
     
