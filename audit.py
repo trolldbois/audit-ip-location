@@ -182,7 +182,7 @@ class FixWorker(DB):
     free_allips=[int(x) for x in free_ip2city.keys()]
     free_allips.sort()
 
-    def fixLoginsTS(self):
+    def fix_logins_ts(self):
         logins = self.session.query(Logins).filter(Logins.ts == None)
         # calculate ts
         cnt=0
@@ -265,6 +265,8 @@ class FixWorker(DB):
         ''' get null-cities IP and fix them'''
         misses=0
         fixes=0
+        log.info('[+] fix location - %d NULL cities'%(session.query(IP2ASN)\
+                                    .filter(IP2ASN.city == None).count()))
         for ipObj in self.session.query(IP2ASN).filter(IP2ASN.city == None):
             location = self.get_location_harder(ipObj.ip)
             if location is None:
@@ -311,8 +313,9 @@ class FixWorker(DB):
                 log.warning('Is %s in unassigned IP space ?'%(ip))
                 continue
             asn = ASN(asn=asn.asn, prefix=asn.prefix, cc=asn.cc)
-            #if asn not in self.session.query(ASN).filter(ASN.asn ==):
-            #    self.session.merge(asn)
+            if self.session.query(ASN).filter(ASN.asn == asn.asn and ASN.prefix == asn.prefix).first() is None:
+                self.session.add(asn)
+                self.session.commit()
             # get the location from the IP prefix
             location = self.get_location(ip)
             if location is None:
@@ -352,7 +355,7 @@ class AnalysisWorker(FixWorker):
             prev_location = IP2ASN()
             try:
                 while prev_location.city is None:
-                    prev_login, prev_location = logins.pop(0)
+                    prev_login, prev_location = logins_ip2asn.pop(0)
             except IndexError,e:
                 continue
             prev_pos = geopy.Point(prev_location.lat, prev_location.lon)
@@ -366,12 +369,12 @@ class AnalysisWorker(FixWorker):
                 if (pos != prev_pos):
                     dist = geopy.distance.distance(prev_pos, pos).km
                     totalkm += dist
-                    duration = (login.ts-prev_login.ts).total_seconds()/3600
+                    duration = (1+(login.ts-prev_login.ts).total_seconds())/3600
                     speed = dist/duration
                     log.debug('%4.2f km/h (%2.2f/%4.2f)'%(speed,dist,(login.ts-prev_login.ts).total_seconds()))
                     if (speed > 300) and (dist > 400): # > 100km/h # FIXME, 400 km for bad geoip
                         print ("A: %s|%4.0f km/h '%s'->'%s'\t(%4.0f km|%2.2f h)"%(
-                                user, speed, prev_location['city'], location['city'], dist, duration))#.encode('utf-8', 'ignore')
+                                user, speed, prev_location.city, location.city, dist, duration))#.encode('utf-8', 'ignore')
                         print "\ta-",prev_login.ts, prev_location
                         print "\tb-",login.ts, location
                 # else continue and switch
@@ -552,9 +555,8 @@ def clean(args):
 def fix(args):
     w = FixWorker(args.dbname)
     #FIXME DEBUG 
-    w.fixLoginsTS()
-    w.fixIP2ASN()
-    w.fixIP2ASN2()
+    w.fix_logins_ts()
+    w.fix_IP2ASN_location()
      
 
 
