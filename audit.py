@@ -1,4 +1,7 @@
 #!/usr/bin/python
+# Loic Jaquemet - <loic.jaquemet+python@gmail.com>
+# GPL v3++
+
 import argparse
 import csv
 import datetime
